@@ -29,18 +29,79 @@ With `--embeddings-only` only `node_feats` is stored.
 
 ## Install
 
+DPA3 **does support GPU acceleration** through DeePMD-kit’s PyTorch + CUDA
+backend. Use the B200 recipe below on HyperGator B200 nodes.
+
+### B200 / GPU install (recommended)
+
+Blackwell (B200, `sm_100`) needs **CUDA ≥ 12.8**, a matching **PyTorch CUDA
+wheel**, and DeePMD built with:
+
 ```bash
-# DeePMD-kit ≥ 3.1 (PyTorch backend) + torch
+export DP_VARIANT=cuda
+export DP_ENABLE_PYTORCH=1
+```
+
+On HyperGator:
+
+```bash
+module load cuda/12.8.0   # or newest >=12.8 on the cluster
+# optional: module load gcc/... if the deepmd build needs it
+
+cd DPA3-MACEOFF-forwardhooker-
+bash scripts/install_b200.sh
+conda activate dpa3_probe_b200
+```
+
+Sanity check:
+
+```bash
+python - <<'PY'
+import torch, deepmd
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+print("cuda available", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
+print("deepmd", deepmd.__version__)
+PY
+```
+
+Manual alternative (same stack):
+
+```bash
+conda env create -f environment_b200.yml
+conda activate dpa3_probe_b200
+
+# PyTorch for CUDA 12.8 (change cu128 → cu129 if needed)
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu128
+
+export DP_VARIANT=cuda DP_ENABLE_PYTORCH=1
+export CUDAToolkit_ROOT=$CUDA_HOME CUDA_PATH=$CUDA_HOME
+pip install "deepmd-kit[torch]>=3.1.0"
+# If GPU ops fail on B200, build from source:
+#   pip install -e "git+https://github.com/deepmodeling/deepmd-kit.git#egg=deepmd-kit[torch]"
+```
+
+Files:
+
+| File | When to use |
+|------|-------------|
+| `environment_b200.yml` + `scripts/install_b200.sh` | **B200 / CUDA GPU** |
+| `environment.yml` | CPU / quick smoke test only |
+
+### CPU / generic (not for B200)
+
+```bash
 conda env create -f environment.yml
 conda activate dpa3_probe
-
-# or pip
-pip install deepmd-kit torch ase numpy tqdm
 ```
 
 Download **DPA3-SPICE-MACE-OFF** from
 [AIS Square](https://www.aissquare.com/models/detail?pageType=models&name=DPA3-SPICE-MACE-OFF&id=388)
 and use the **DPA3-L6** checkpoint file (`.pt` / `.pth`).
+
+Always pass `--device cuda` (or set `CONFIG["device"]="cuda"`) when running on GPU.
 
 ## 1) Cache atomic embeddings (once)
 

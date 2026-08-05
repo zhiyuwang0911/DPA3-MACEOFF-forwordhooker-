@@ -1,0 +1,30 @@
+# DPA3-PROBE on NVIDIA Blackwell GPUs (B200 / sm_100).
+#
+# B200 needs CUDA >= 12.8. Prefer installing PyTorch from the official
+# CUDA wheel index, then build DeePMD-kit with CUDA + PyTorch custom OPs.
+#
+# On HyperGator (example):
+#   module load cuda/12.8.0   # or newest >=12.8 available
+#   module load gcc/12.2.0   # if needed for deepmd build
+#   bash scripts/install_b200.sh
+#
+# Or step-by-step (see README "B200 / GPU install").
+#
+# This conda file only sets the Python base; CUDA torch + deepmd are
+# installed by scripts/install_b200.sh so versions match the cluster CUDA.
+
+name: dpa3_probe_b200
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - ase
+  - tqdm
+  - pip
+  - cmake
+  - ninja
+  - pyyaml
+  - pip:
+      - matplotlib

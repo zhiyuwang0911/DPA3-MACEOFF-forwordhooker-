@@ -1,14 +1,20 @@
+# Generic / CPU-friendly env (NOT recommended for B200 GPUs).
+# For NVIDIA B200 / HyperGator GPU nodes, use environment_b200.yml
+# and follow the B200 section in README.md.
+#
+#   conda env create -f environment.yml
+#   conda activate dpa3_probe
+
 name: dpa3_probe
 channels:
-  - pytorch
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
-  - pytorch>=2.1
   - numpy
   - ase
   - tqdm
   - pip
   - pip:
-    - deepmd-kit>=3.1.0
+      - torch
+      - deepmd-kit>=3.1.0
