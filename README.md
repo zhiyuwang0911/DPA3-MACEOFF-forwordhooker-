@@ -12,6 +12,7 @@ Same idea as PROBE-multitask + MACE-OFF23, but the backbone is **DPA3**
 
 | Script | Role |
 |--------|------|
+| `save_atomic_dpa3.py` | Same as MACE `save_atomic_092.py`: dump last-layer feats to one `.npz` (GMM/KDE) |
 | `cache_dpa3_embeddings.py` | **One-pass** DPA3 forward; save `{structure_idx}.pt` embeddings (cache once) |
 | `train_dpa3_multitask.py` | Train PROBE heads (energy + Fa + Fs) on frozen DPA3 feats |
 | `infer_dpa3_multitask.py` | Test / metrics; optional embedding cache |
