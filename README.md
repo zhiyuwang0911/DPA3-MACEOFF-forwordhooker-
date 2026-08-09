@@ -103,6 +103,18 @@ and use the **DPA3-L6** checkpoint file (`.pt` / `.pth`).
 
 Always pass `--device cuda` (or set `CONFIG["device"]="cuda"`) when running on GPU.
 
+### HPC tip: `No package metadata was found for mpich`
+
+If `load_dpa3` fails with that message, DeePMD is choking on MPI packaging
+(not on your `.pt` file). Fix inside the conda env:
+
+```bash
+module unload mpich openmpi 2>/dev/null || true
+conda activate dpa3_probe_b200
+conda install -y -c conda-forge mpich mpi4py
+# then retry save_atomic_dpa3.py / train_dpa3_multitask.py
+```
+
 ## 1) Cache atomic embeddings (once)
 
 ```bash
