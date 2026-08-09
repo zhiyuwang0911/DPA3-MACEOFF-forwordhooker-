@@ -199,14 +199,27 @@ def find_hook_module(
 
 
 def _unwrap_deepmd_nn(wrapper: Any) -> nn.Module:
-    """Best-effort access to the underlying nn.Module from DeePMD loaders."""
-    candidates = [
+    """Best-effort access to the underlying nn.Module from DeePMD loaders.
+
+    DeePMD-kit 3.1 high-level ``DeepEval`` stores the PT backend at
+    ``wrapper.deep_eval`` and exposes ``get_model()``. The PT backend keeps
+    the runnable module at ``deep_eval.dp.model['Default']``.
+    """
+    candidates: List[Any] = [
         wrapper,
         getattr(wrapper, "model", None),
         getattr(wrapper, "deep_eval", None),
         getattr(wrapper, "_model", None),
         getattr(wrapper, "module", None),
     ]
+
+    # Official API (3.1+)
+    if hasattr(wrapper, "get_model") and callable(wrapper.get_model):
+        try:
+            candidates.insert(0, wrapper.get_model())
+        except Exception:  # noqa: BLE001
+            pass
+
     deep_eval = getattr(wrapper, "deep_eval", None)
     if deep_eval is not None:
         candidates.extend([
@@ -215,14 +228,33 @@ def _unwrap_deepmd_nn(wrapper: Any) -> nn.Module:
             getattr(deep_eval, "model", None),
             getattr(deep_eval, "_model", None),
             getattr(deep_eval, "pt_model", None),
+            getattr(deep_eval, "dp", None),
         ])
+        if hasattr(deep_eval, "get_model") and callable(deep_eval.get_model):
+            try:
+                candidates.insert(0, deep_eval.get_model())
+            except Exception:  # noqa: BLE001
+                pass
+        dp = getattr(deep_eval, "dp", None)
+        if dp is not None:
+            # ModelWrapper: dp.model is often a ModuleDict with "Default"
+            mdict = getattr(dp, "model", None)
+            if isinstance(mdict, nn.ModuleDict) and "Default" in mdict:
+                candidates.insert(0, mdict["Default"])
+            elif isinstance(mdict, dict) and "Default" in mdict:
+                candidates.insert(0, mdict["Default"])
+            candidates.append(mdict)
+
     for c in candidates:
         if isinstance(c, nn.Module):
             return c
-        # some wrappers expose .model as another object
         m = getattr(c, "model", None) if c is not None else None
         if isinstance(m, nn.Module):
             return m
+        if isinstance(m, nn.ModuleDict) and "Default" in m:
+            return m["Default"]
+        if isinstance(m, dict) and "Default" in m and isinstance(m["Default"], nn.Module):
+            return m["Default"]
     raise TypeError(
         "Could not unwrap a torch.nn.Module from the loaded DPA3 object. "
         "Ensure you load a PyTorch DeePMD model (not a pure C++ backend)."
@@ -234,31 +266,46 @@ def _unwrap_deepmd_nn(wrapper: Any) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 class DPA3FeatureExtractor(nn.Module):
-    """Frozen DPA3/DeePMD model + forward hook on last atomic embedding layer."""
+    """Frozen DPA3/DeePMD model; last-layer atomic embeddings via
+    ``eval_descriptor`` (preferred) and/or a forward hook.
+    """
 
     def __init__(
         self,
-        model: nn.Module,
+        model: Optional[nn.Module],
         type_map: Sequence[str],
         hook_module: Optional[str] = None,
         device: str = "cpu",
         infer_wrapper: Any = None,
+        prefer_eval_descriptor: bool = True,
     ):
         super().__init__()
         self.model = model
         self.type_map = list(type_map)
         self.device = device
-        self.infer_wrapper = infer_wrapper  # DeepPot / DeepEval optional
+        self.infer_wrapper = infer_wrapper  # DeepPot / DeepEval
         self._last_feats: Optional[torch.Tensor] = None
         self.feat_dim: Optional[int] = None
+        self.hook_name = None
+        self._hook_handle = None
+        self.prefer_eval_descriptor = prefer_eval_descriptor and (
+            infer_wrapper is not None and hasattr(infer_wrapper, "eval_descriptor")
+        )
 
-        self.hook_name, hook_mod = find_hook_module(self.model, hook_module)
-        self._hook_handle = hook_mod.register_forward_hook(self._hook_fn)
-        print(f"DPA3FeatureExtractor: forward hook on '{self.hook_name}'")
-
-        self.model.to(device).eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
+        if self.prefer_eval_descriptor:
+            print("DPA3FeatureExtractor: using DeepEval.eval_descriptor() "
+                  "for atomic embeddings (recommended for DPA3 / JIT models)")
+        elif model is not None:
+            self.hook_name, hook_mod = find_hook_module(self.model, hook_module)
+            self._hook_handle = hook_mod.register_forward_hook(self._hook_fn)
+            print(f"DPA3FeatureExtractor: forward hook on '{self.hook_name}'")
+            self.model.to(device).eval()
+            for p in self.model.parameters():
+                p.requires_grad = False
+        else:
+            raise RuntimeError(
+                "Need either DeepEval.eval_descriptor or an nn.Module for hooks."
+            )
 
     def _hook_fn(self, module, inputs, output):
         self._last_feats = output
@@ -268,38 +315,63 @@ class DPA3FeatureExtractor(nn.Module):
             self._hook_handle.remove()
             self._hook_handle = None
 
+    def eval(self):
+        if self.model is not None:
+            self.model.eval()
+        return self
+
+    def _eval_descriptor(
+        self,
+        coords: np.ndarray,
+        atype: np.ndarray,
+        cell: Optional[np.ndarray],
+    ) -> torch.Tensor:
+        """Return atomic descriptor [natoms, D] via DeePMD official API."""
+        wrap = self.infer_wrapper
+        nat = coords.shape[0]
+        coord = coords.reshape(1, nat, 3)
+        box = None if cell is None else np.asarray(cell, dtype=np.float64).reshape(1, 3, 3)
+        at = atype.reshape(1, nat)
+        try:
+            desc = wrap.eval_descriptor(coord, box, at)
+        except TypeError:
+            coord_flat = coords.reshape(1, -1)
+            box_flat = None if cell is None else np.asarray(cell).reshape(1, 9)
+            desc = wrap.eval_descriptor(coord_flat, box_flat, atype)
+        desc = np.asarray(desc, dtype=np.float32)
+        # shapes seen: [nframes, natoms, D] or [natoms, D]
+        if desc.ndim == 3:
+            desc = desc[0]
+        if desc.ndim != 2 or desc.shape[0] != nat:
+            raise RuntimeError(
+                f"eval_descriptor returned shape {desc.shape}, expected [{nat}, D]"
+            )
+        return torch.from_numpy(np.ascontiguousarray(desc))
+
     def _eval_deepmd_energy_force(
         self,
         coords: np.ndarray,
         atype: np.ndarray,
         cell: Optional[np.ndarray],
     ) -> Tuple[float, np.ndarray]:
-        """Energy (eV) and forces (eV/Å) via DeePMD infer API if available."""
-        # coords: [nat, 3], atype: [nat]
+        """Energy (eV) and forces (eV/Å) via DeePMD infer API."""
         wrap = self.infer_wrapper
         if wrap is None:
             raise RuntimeError(
-                "No DeePMD infer wrapper; cannot compute energy/forces. "
-                "Load with load_dpa3() so DeepPot/DeepEval is available."
+                "No DeePMD infer wrapper; cannot compute energy/forces."
             )
         nat = coords.shape[0]
         coord = coords.reshape(1, nat, 3)
-        box = None if cell is None else cell.reshape(1, 3, 3)
+        box = None if cell is None else np.asarray(cell, dtype=np.float64).reshape(1, 3, 3)
         at = atype.reshape(1, nat)
 
-        # DeepPot / DeepEval signatures vary slightly across versions
         try:
-            if hasattr(wrap, "eval"):
-                out = wrap.eval(coord, box, at)
-            else:
-                out = wrap(coord, box, at)
+            out = wrap.eval(coord, box, at) if hasattr(wrap, "eval") else wrap(coord, box, at)
         except TypeError:
-            # some APIs want flat coords [1, nat*3] and box [1, 9]
             coord_flat = coords.reshape(1, -1)
-            box_flat = None if cell is None else cell.reshape(1, 9)
+            box_flat = None if cell is None else np.asarray(cell).reshape(1, 9)
             out = wrap.eval(coord_flat, box_flat, atype)
 
-        # out is typically (energy, force, virial) or dict
         if isinstance(out, dict):
             e = out.get("energy", out.get("energies"))
             f = out.get("force", out.get("forces"))
@@ -333,33 +405,31 @@ class DPA3FeatureExtractor(nn.Module):
         n_atoms = positions.shape[0]
         atype = _z_to_atype(atomic_numbers, self.type_map)
 
-        self._last_feats = None
-
-        # Prefer DeePMD infer for energy/force (correct neighbor list + autograd)
-        if compute_force and self.infer_wrapper is not None:
+        # Energy / forces
+        if self.infer_wrapper is not None:
             energy, forces = self._eval_deepmd_energy_force(positions, atype, cell)
-            # Second pass may be needed only for hook if eval path does not run eager model.
-            # If hook already fired during eval, use it; else run eager forward if available.
-            if self._last_feats is None:
-                self._run_eager_for_hook(positions, atype, cell)
         else:
-            energy, forces = self._run_eager_for_hook(
-                positions, atype, cell, return_energy_force=True
-            )
+            energy, forces = 0.0, np.zeros((n_atoms, 3), dtype=np.float64)
 
-        if self._last_feats is None:
-            raise RuntimeError(
-                f"Forward hook on '{self.hook_name}' did not fire. "
-                "Try a different --hook-module path (inspect model.named_modules())."
-            )
+        # Atomic embeddings
+        if self.prefer_eval_descriptor:
+            node_feats = self._eval_descriptor(positions, atype, cell)
+        else:
+            self._last_feats = None
+            self._run_eager_for_hook(positions, atype, cell)
+            if self._last_feats is None:
+                raise RuntimeError(
+                    f"Forward hook on '{self.hook_name}' did not fire. "
+                    "Try --hook-module or rely on eval_descriptor."
+                )
+            node_feats = _flatten_feat(self._last_feats, n_atoms).cpu()
 
-        node_feats = _flatten_feat(self._last_feats, n_atoms).cpu()
         if self.feat_dim is None:
             self.feat_dim = int(node_feats.shape[-1])
             print(f"DPA3FeatureExtractor: feat_dim={self.feat_dim}")
 
         out = {
-            "node_feats": node_feats.contiguous(),
+            "node_feats": node_feats.float().contiguous(),
             "pred_energy": torch.tensor(float(energy), dtype=torch.float32),
         }
         if compute_force:
@@ -373,10 +443,7 @@ class DPA3FeatureExtractor(nn.Module):
         cell: Optional[np.ndarray],
         return_energy_force: bool = False,
     ):
-        """Attempt an eager nn.Module forward so the hook fires.
-
-        DeePMD internal APIs differ by version; we try several call patterns.
-        """
+        """Attempt an eager nn.Module forward so the hook fires."""
         device = self.device
         pos = torch.tensor(positions, dtype=torch.float64, device=device)
         at = torch.tensor(atype, dtype=torch.long, device=device)
@@ -384,54 +451,43 @@ class DPA3FeatureExtractor(nn.Module):
 
         if cell is None:
             box = torch.tensor(_large_box(), dtype=torch.float64, device=device)
-            pbc = torch.tensor([False, False, False], device=device)
         else:
             box = torch.tensor(np.asarray(cell, dtype=np.float64).reshape(3, 3),
                                dtype=torch.float64, device=device)
-            pbc = torch.tensor([True, True, True], device=device)
 
         model = self.model
         call_errors = []
+        attempts = [
+            lambda: model(
+                coord=pos.unsqueeze(0),
+                atype=at.unsqueeze(0),
+                box=box.unsqueeze(0),
+            ),
+            lambda: model(
+                pos.reshape(1, -1),
+                at.unsqueeze(0),
+                box.reshape(1, -1),
+            ),
+            lambda: model.forward_common_batched(  # type: ignore[attr-defined]
+                {"coord": pos.unsqueeze(0), "atype": at.unsqueeze(0),
+                 "box": box.unsqueeze(0)},
+            ),
+        ]
+        result = None
+        for fn in attempts:
+            try:
+                result = fn()
+                break
+            except Exception as e:  # noqa: BLE001
+                call_errors.append(str(e))
 
-        def _try_calls():
-            # Common DeepMD PT signatures (names differ across 3.0–3.1)
-            attempts = [
-                lambda: model(
-                    coord=pos.unsqueeze(0),
-                    atype=at.unsqueeze(0),
-                    box=box.unsqueeze(0),
-                ),
-                lambda: model(
-                    pos.reshape(1, -1),
-                    at.unsqueeze(0),
-                    box.reshape(1, -1),
-                ),
-                lambda: model.forward_common_batched(  # type: ignore[attr-defined]
-                    {"coord": pos.unsqueeze(0), "atype": at.unsqueeze(0),
-                     "box": box.unsqueeze(0)},
-                ),
-            ]
-            for fn in attempts:
-                try:
-                    return fn()
-                except Exception as e:  # noqa: BLE001 — probe multiple APIs
-                    call_errors.append(str(e))
-            return None
-
-        result = _try_calls()
         if result is None and self._last_feats is None:
             raise RuntimeError(
                 "Eager DPA3 forward failed and hook did not fire.\n"
-                "Tried multiple call signatures. Errors:\n  - "
-                + "\n  - ".join(call_errors[:5])
-                + "\nInstall a matching deepmd-kit version and/or pass "
-                "--hook-module for your checkpoint layout."
+                + "\n".join(call_errors[:5])
             )
-
         if not return_energy_force:
             return None, None
-
-        # Parse energy/force from eager result if possible
         energy, forces = 0.0, np.zeros((n, 3), dtype=np.float64)
         if isinstance(result, dict):
             if "energy" in result:
@@ -455,11 +511,8 @@ def load_dpa3(
     """
     Load a frozen DPA3 checkpoint (DPA3-L6 / DPA3-SPICE-MACE-OFF etc.).
 
-    Args:
-        model_path: Path to DeePMD model file (``.pt`` / ``.pth``) from AIS Square.
-        device: ``cuda`` or ``cpu``.
-        hook_module: Optional explicit module path for the forward hook.
-        type_map: Optional override; otherwise read from the model.
+    Uses DeePMD ``DeepEval`` / ``DeepPot``. Atomic embeddings come from
+    ``eval_descriptor`` (robust with JIT). Forward hooks are optional fallback.
     """
     if not _DP_AVAILABLE:
         raise ImportError(
@@ -475,10 +528,37 @@ def load_dpa3(
     infer_wrapper = None
     nn_model: Optional[nn.Module] = None
     resolved_type_map = list(type_map) if type_map is not None else None
+    load_errors: List[str] = []
 
-    # 1) Preferred: DeepEval / DeepPot (correct neighbor list + energy/force)
-    load_errors = []
-    if _DeepEval is not None:
+    # 1) High-level DeepEval (preferred in deepmd 3.1)
+    try:
+        from deepmd.infer import DeepEval as HighLevelDeepEval  # type: ignore
+        # DeepPot is the energy model interface; DeepEval auto-selects
+        try:
+            from deepmd.infer import DeepPot  # type: ignore
+            infer_wrapper = DeepPot(model_path)
+            print("Loaded via DeepPot")
+        except Exception as e_dp:  # noqa: BLE001
+            load_errors.append(f"DeepPot: {e_dp}")
+            infer_wrapper = HighLevelDeepEval(model_path)
+            print("Loaded via DeepEval")
+        if resolved_type_map is None and hasattr(infer_wrapper, "get_type_map"):
+            resolved_type_map = list(infer_wrapper.get_type_map())
+        try:
+            nn_model = _unwrap_deepmd_nn(infer_wrapper)
+            print(f"Unwrapped nn.Module: {type(nn_model).__name__}")
+        except TypeError as e:
+            load_errors.append(f"DeepEval unwrap: {e}")
+            # OK if eval_descriptor is available
+            if not hasattr(infer_wrapper, "eval_descriptor"):
+                raise
+            print("No unwrap for hooks; will use eval_descriptor() only")
+    except Exception as e:  # noqa: BLE001
+        load_errors.append(f"DeepEval/DeepPot: {e}")
+        infer_wrapper = None
+
+    # 2) Fallback: older DeepEval ctor used elsewhere
+    if infer_wrapper is None and _DeepEval is not None:
         try:
             infer_wrapper = _DeepEval(model_path, device=device)
             if resolved_type_map is None and hasattr(infer_wrapper, "get_type_map"):
@@ -491,31 +571,18 @@ def load_dpa3(
             load_errors.append(f"DeepEval: {e}")
             infer_wrapper = None
 
-    if infer_wrapper is None and _DeepPot is not None:
-        try:
-            infer_wrapper = _DeepPot(model_path)
-            if resolved_type_map is None and hasattr(infer_wrapper, "get_type_map"):
-                resolved_type_map = list(infer_wrapper.get_type_map())
-            try:
-                nn_model = _unwrap_deepmd_nn(infer_wrapper)
-            except TypeError as e:
-                load_errors.append(f"DeepPot unwrap: {e}")
-        except Exception as e:  # noqa: BLE001
-            load_errors.append(f"DeepPot: {e}")
-
-    # 2) Fallback: raw torch.load (training checkpoint / module dump)
-    if nn_model is None:
+    # 3) Raw torch.load fallback
+    if nn_model is None and infer_wrapper is None:
         try:
             obj = torch.load(model_path, map_location=device, weights_only=False)
             if isinstance(obj, nn.Module):
                 nn_model = obj
             elif isinstance(obj, dict):
-                for key in ("model", "module", "state_dict"):
+                for key in ("model", "module"):
                     if key in obj and isinstance(obj[key], nn.Module):
                         nn_model = obj[key]
                         break
                 if nn_model is None and "model" in obj and isinstance(obj["model"], dict):
-                    # deepmd serialized dict — try official deserialize
                     try:
                         from deepmd.pt.model.model import BaseModel  # type: ignore
                         nn_model = BaseModel.deserialize(obj["model"])
@@ -534,14 +601,22 @@ def load_dpa3(
         except Exception as e:  # noqa: BLE001
             load_errors.append(f"torch.load: {e}")
 
-    if nn_model is None:
+    can_descriptor = infer_wrapper is not None and hasattr(infer_wrapper, "eval_descriptor")
+    if nn_model is None and not can_descriptor:
+        hint = ""
+        joined = "\n".join(load_errors)
+        if "mpich" in joined.lower() and "metadata" in joined.lower():
+            hint = (
+                "\n\nHint: HPC MPI/metadata issue. Try:\n"
+                "  conda install -y -c conda-forge mpich mpi4py\n"
+            )
         raise RuntimeError(
-            "Failed to load DPA3 as a torch.nn.Module for forward hooks.\n"
-            + "\n".join(load_errors)
+            "Failed to load DPA3 (need DeepEval.eval_descriptor or nn.Module).\n"
+            + joined
+            + hint
         )
 
     if resolved_type_map is None:
-        # organic SPICE-style default; override if your checkpoint differs
         resolved_type_map = ["H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
         print(
             "WARNING: type_map not found in checkpoint; using SPICE-like default:\n"
@@ -554,6 +629,7 @@ def load_dpa3(
         hook_module=hook_module,
         device=device,
         infer_wrapper=infer_wrapper,
+        prefer_eval_descriptor=can_descriptor,
     )
     print(f"type_map={extractor.type_map}")
     return extractor
