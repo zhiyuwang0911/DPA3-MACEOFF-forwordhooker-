@@ -407,7 +407,6 @@ class DPA3FeatureExtractor(nn.Module):
 
         raise RuntimeError(f"Unexpected DeePMD eval return type: {type(out)}")
 
-    @torch.no_grad()
     def forward_structure(
         self,
         positions: np.ndarray,
@@ -420,30 +419,35 @@ class DPA3FeatureExtractor(nn.Module):
 
         Returns dict with:
           node_feats [nat, D], pred_energy scalar, pred_forces [nat, 3] (optional)
+
+        Note: DeePMD force eval needs autograd on coordinates. Do not wrap this
+        method in ``torch.no_grad()`` at the caller.
         """
         positions = np.asarray(positions, dtype=np.float64)
         atomic_numbers = np.asarray(atomic_numbers, dtype=np.int32)
         n_atoms = positions.shape[0]
         atype = _z_to_atype(atomic_numbers, self.type_map)
 
-        # Energy / forces
+        # Energy / forces — DeepPot.eval uses torch.autograd.grad on coords
         if self.infer_wrapper is not None:
-            energy, forces = self._eval_deepmd_energy_force(positions, atype, cell)
+            with torch.enable_grad():
+                energy, forces = self._eval_deepmd_energy_force(positions, atype, cell)
         else:
             energy, forces = 0.0, np.zeros((n_atoms, 3), dtype=np.float64)
 
-        # Atomic embeddings
-        if self.prefer_eval_descriptor:
-            node_feats = self._eval_descriptor(positions, atype, cell)
-        else:
-            self._last_feats = None
-            self._run_eager_for_hook(positions, atype, cell)
-            if self._last_feats is None:
-                raise RuntimeError(
-                    f"Forward hook on '{self.hook_name}' did not fire. "
-                    "Try --hook-module or rely on eval_descriptor."
-                )
-            node_feats = _flatten_feat(self._last_feats, n_atoms).cpu()
+        # Atomic embeddings (descriptor path does not need grads)
+        with torch.no_grad():
+            if self.prefer_eval_descriptor:
+                node_feats = self._eval_descriptor(positions, atype, cell)
+            else:
+                self._last_feats = None
+                self._run_eager_for_hook(positions, atype, cell)
+                if self._last_feats is None:
+                    raise RuntimeError(
+                        f"Forward hook on '{self.hook_name}' did not fire. "
+                        "Try --hook-module or rely on eval_descriptor."
+                    )
+                node_feats = _flatten_feat(self._last_feats, n_atoms).cpu()
 
         if self.feat_dim is None:
             self.feat_dim = int(node_feats.shape[-1])

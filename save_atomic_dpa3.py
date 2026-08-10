@@ -112,49 +112,49 @@ def main():
     all_n_atoms = []
 
     extractor.eval()
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Extracting DPA3 embeddings"):
-            # energy-only path is enough for this npz (same as MACE script)
-            atom_feats, atom_mask, pred_energy, true_energy, n_atoms = process_batch_dpa3(
-                batch=batch,
-                device=device,
-                extractor=extractor,
-                compute_force=False,
-            )
+    # Do NOT wrap in torch.no_grad(): DeePMD energy/force eval needs autograd.
+    for batch in tqdm(loader, desc="Extracting DPA3 embeddings"):
+        # energy-only path is enough for this npz (same as MACE script)
+        atom_feats, atom_mask, pred_energy, true_energy, n_atoms = process_batch_dpa3(
+            batch=batch,
+            device=device,
+            extractor=extractor,
+            compute_force=False,
+        )
 
-            mean_feat, max_feat = masked_mean_max(atom_feats, atom_mask)
-            pooled = torch.cat(
-                [
-                    mean_feat,
-                    max_feat,
-                    pred_energy.unsqueeze(-1),
-                    n_atoms.unsqueeze(-1),
-                ],
-                dim=-1,
-            )
+        mean_feat, max_feat = masked_mean_max(atom_feats, atom_mask)
+        pooled = torch.cat(
+            [
+                mean_feat,
+                max_feat,
+                pred_energy.unsqueeze(-1),
+                n_atoms.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
 
-            B = atom_feats.shape[0]
-            for i in range(B):
-                n = int(n_atoms[i].detach().cpu().item())
+        B = atom_feats.shape[0]
+        for i in range(B):
+            n = int(n_atoms[i].detach().cpu().item())
 
-                atom_i = atom_feats[i, :n, :].detach().cpu().numpy().astype(np.float32)
-                mean_i = mean_feat[i].detach().cpu().numpy().astype(np.float32)
-                max_i = max_feat[i].detach().cpu().numpy().astype(np.float32)
-                pooled_i = pooled[i].detach().cpu().numpy().astype(np.float32)
+            atom_i = atom_feats[i, :n, :].detach().cpu().numpy().astype(np.float32)
+            mean_i = mean_feat[i].detach().cpu().numpy().astype(np.float32)
+            max_i = max_feat[i].detach().cpu().numpy().astype(np.float32)
+            pooled_i = pooled[i].detach().cpu().numpy().astype(np.float32)
 
-                pred_i = float(pred_energy[i].detach().cpu().item())
-                true_i = float(true_energy[i].detach().cpu().item())
-                err_i = abs(true_i - pred_i)
+            pred_i = float(pred_energy[i].detach().cpu().item())
+            true_i = float(true_energy[i].detach().cpu().item())
+            err_i = abs(true_i - pred_i)
 
-                all_atom_feats.append(atom_i)
-                all_mean_feats.append(mean_i)
-                all_max_feats.append(max_i)
-                all_mean_max_energy_natoms.append(pooled_i)
+            all_atom_feats.append(atom_i)
+            all_mean_feats.append(mean_i)
+            all_max_feats.append(max_i)
+            all_mean_max_energy_natoms.append(pooled_i)
 
-                all_pred_energy.append(pred_i)
-                all_true_energy.append(true_i)
-                all_abs_error.append(err_i)
-                all_n_atoms.append(n)
+            all_pred_energy.append(pred_i)
+            all_true_energy.append(true_i)
+            all_abs_error.append(err_i)
+            all_n_atoms.append(n)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_npz)) or ".", exist_ok=True)
     np.savez_compressed(
