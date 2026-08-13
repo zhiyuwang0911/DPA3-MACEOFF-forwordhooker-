@@ -369,43 +369,97 @@ class DPA3FeatureExtractor(nn.Module):
             )
         return torch.from_numpy(np.ascontiguousarray(desc))
 
-    def _eval_deepmd_energy_force(
+    def _eval_energy_force_and_descriptor(
         self,
         coords: np.ndarray,
         atype: np.ndarray,
         cell: Optional[np.ndarray],
-    ) -> Tuple[float, np.ndarray]:
-        """Energy (eV) and forces (eV/Å) via DeePMD infer API."""
+        want_descriptor: bool,
+    ) -> Tuple[float, np.ndarray, Optional[torch.Tensor]]:
+        """One DeepPot.eval pass: energy, forces, optional descriptor.
+
+        DeePMD's ``eval_descriptor`` itself calls ``eval()``, which uses
+        ``torch.autograd.grad`` on coordinates — must run under enable_grad.
+        See DPA3 / DeepEval PT backend docs.
+        """
         wrap = self.infer_wrapper
         if wrap is None:
-            raise RuntimeError(
-                "No DeePMD infer wrapper; cannot compute energy/forces."
-            )
+            raise RuntimeError("No DeePMD infer wrapper.")
+
         nat = coords.shape[0]
         coord = coords.reshape(1, nat, 3)
         box = None if cell is None else np.asarray(cell, dtype=np.float64).reshape(1, 3, 3)
         at = atype.reshape(1, nat)
 
-        try:
-            out = wrap.eval(coord, box, at) if hasattr(wrap, "eval") else wrap(coord, box, at)
-        except TypeError:
-            coord_flat = coords.reshape(1, -1)
-            box_flat = None if cell is None else np.asarray(cell).reshape(1, 9)
-            out = wrap.eval(coord_flat, box_flat, atype)
+        # Hook descriptor collection onto the Default head (official DeePMD path)
+        model = None
+        if want_descriptor:
+            try:
+                backend = getattr(wrap, "deep_eval", wrap)
+                dp = getattr(backend, "dp", None)
+                if dp is not None and hasattr(dp, "model"):
+                    m = dp.model
+                    model = m["Default"] if ("Default" in m) else None
+                if model is not None and hasattr(model, "set_eval_descriptor_hook"):
+                    model.set_eval_descriptor_hook(True)
+            except Exception:  # noqa: BLE001
+                model = None
+
+        with torch.enable_grad():
+            try:
+                out = wrap.eval(coord, box, at) if hasattr(wrap, "eval") else wrap(coord, box, at)
+            except TypeError:
+                coord_flat = coords.reshape(1, -1)
+                box_flat = None if cell is None else np.asarray(cell).reshape(1, 9)
+                out = wrap.eval(coord_flat, box_flat, atype)
 
         if isinstance(out, dict):
             e = out.get("energy", out.get("energies"))
             f = out.get("force", out.get("forces"))
             energy = float(np.asarray(e).reshape(-1)[0])
             forces = np.asarray(f, dtype=np.float64).reshape(nat, 3)
-            return energy, forces
-
-        if isinstance(out, (tuple, list)):
+        elif isinstance(out, (tuple, list)):
             energy = float(np.asarray(out[0]).reshape(-1)[0])
             forces = np.asarray(out[1], dtype=np.float64).reshape(nat, 3)
-            return energy, forces
+        else:
+            raise RuntimeError(f"Unexpected DeePMD eval return type: {type(out)}")
 
-        raise RuntimeError(f"Unexpected DeePMD eval return type: {type(out)}")
+        node_feats = None
+        if want_descriptor and model is not None and hasattr(model, "eval_descriptor"):
+            try:
+                desc = model.eval_descriptor()
+                # tensor [nf, nat, D] or [nat, D]
+                if hasattr(desc, "detach"):
+                    desc_t = desc.detach().cpu().float()
+                else:
+                    desc_t = torch.as_tensor(np.asarray(desc), dtype=torch.float32)
+                if desc_t.ndim == 3:
+                    desc_t = desc_t[0]
+                if desc_t.shape[0] != nat:
+                    raise RuntimeError(
+                        f"descriptor shape {tuple(desc_t.shape)} != n_atoms={nat}"
+                    )
+                node_feats = desc_t.contiguous()
+            finally:
+                if hasattr(model, "set_eval_descriptor_hook"):
+                    model.set_eval_descriptor_hook(False)
+        elif want_descriptor:
+            # Fallback: public API (second forward — still needs enable_grad)
+            with torch.enable_grad():
+                try:
+                    desc = wrap.eval_descriptor(coord, box, at)
+                except TypeError:
+                    desc = wrap.eval_descriptor(
+                        coords.reshape(1, -1),
+                        None if cell is None else np.asarray(cell).reshape(1, 9),
+                        atype,
+                    )
+            desc = np.asarray(desc, dtype=np.float32)
+            if desc.ndim == 3:
+                desc = desc[0]
+            node_feats = torch.from_numpy(np.ascontiguousarray(desc))
+
+        return energy, forces, node_feats
 
     def forward_structure(
         self,
@@ -420,34 +474,34 @@ class DPA3FeatureExtractor(nn.Module):
         Returns dict with:
           node_feats [nat, D], pred_energy scalar, pred_forces [nat, 3] (optional)
 
-        Note: DeePMD force eval needs autograd on coordinates. Do not wrap this
-        method in ``torch.no_grad()`` at the caller.
+        DeePMD force + descriptor hooks require autograd on coordinates
+        (see https://docs.deepmodeling.com/projects/deepmd/en/v3.1.0rc0/model/dpa3.html
+        and DeepEval.eval_descriptor implementation).
         """
         positions = np.asarray(positions, dtype=np.float64)
         atomic_numbers = np.asarray(atomic_numbers, dtype=np.int32)
         n_atoms = positions.shape[0]
         atype = _z_to_atype(atomic_numbers, self.type_map)
 
-        # Energy / forces — DeepPot.eval uses torch.autograd.grad on coords
-        if self.infer_wrapper is not None:
-            with torch.enable_grad():
-                energy, forces = self._eval_deepmd_energy_force(positions, atype, cell)
-        else:
-            energy, forces = 0.0, np.zeros((n_atoms, 3), dtype=np.float64)
+        if self.infer_wrapper is None:
+            raise RuntimeError("DPA3FeatureExtractor requires a DeePMD infer wrapper.")
 
-        # Atomic embeddings (descriptor path does not need grads)
-        with torch.no_grad():
-            if self.prefer_eval_descriptor:
-                node_feats = self._eval_descriptor(positions, atype, cell)
-            else:
-                self._last_feats = None
+        want_desc = bool(self.prefer_eval_descriptor)
+        energy, forces, node_feats = self._eval_energy_force_and_descriptor(
+            positions, atype, cell, want_descriptor=want_desc
+        )
+
+        if node_feats is None:
+            # Hook-based fallback (eager / no_jit models)
+            self._last_feats = None
+            with torch.enable_grad():
                 self._run_eager_for_hook(positions, atype, cell)
-                if self._last_feats is None:
-                    raise RuntimeError(
-                        f"Forward hook on '{self.hook_name}' did not fire. "
-                        "Try --hook-module or rely on eval_descriptor."
-                    )
-                node_feats = _flatten_feat(self._last_feats, n_atoms).cpu()
+            if self._last_feats is None:
+                raise RuntimeError(
+                    "Failed to obtain DPA3 atomic embeddings via eval_descriptor "
+                    "or forward hook. Try loading with no_jit=True."
+                )
+            node_feats = _flatten_feat(self._last_feats, n_atoms).cpu()
 
         if self.feat_dim is None:
             self.feat_dim = int(node_feats.shape[-1])
@@ -558,15 +612,25 @@ def load_dpa3(
     # 1) High-level DeepEval (preferred in deepmd 3.1)
     try:
         from deepmd.infer import DeepEval as HighLevelDeepEval  # type: ignore
-        # DeepPot is the energy model interface; DeepEval auto-selects
+        # DeepPot is the energy model interface; DeepEval auto-selects.
+        # no_jit=True keeps an eager Module (better autograd / hooks for DPA3).
+        # See: https://docs.deepmodeling.com/projects/deepmd/en/v3.1.0rc0/model/dpa3.html
         try:
             from deepmd.infer import DeepPot  # type: ignore
-            infer_wrapper = DeepPot(model_path)
-            print("Loaded via DeepPot")
+            try:
+                infer_wrapper = DeepPot(model_path, no_jit=True)
+                print("Loaded via DeepPot (no_jit=True)")
+            except TypeError:
+                infer_wrapper = DeepPot(model_path)
+                print("Loaded via DeepPot")
         except Exception as e_dp:  # noqa: BLE001
             load_errors.append(f"DeepPot: {e_dp}")
-            infer_wrapper = HighLevelDeepEval(model_path)
-            print("Loaded via DeepEval")
+            try:
+                infer_wrapper = HighLevelDeepEval(model_path, no_jit=True)
+                print("Loaded via DeepEval (no_jit=True)")
+            except TypeError:
+                infer_wrapper = HighLevelDeepEval(model_path)
+                print("Loaded via DeepEval")
         if resolved_type_map is None and hasattr(infer_wrapper, "get_type_map"):
             resolved_type_map = list(infer_wrapper.get_type_map())
         try:
