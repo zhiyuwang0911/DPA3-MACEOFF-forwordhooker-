@@ -752,17 +752,41 @@ def _frames_from_xyz(xyz_path: str, max_structures: Optional[int] = None) -> Lis
     from ..io_extxyz import iter_probe_extxyz
 
     frames = []
+    n_missing_forces = 0
+    n_missing_energy = 0
     for fr in iter_probe_extxyz(xyz_path, max_structures=max_structures):
         zs = _symbols_to_z(fr["symbols"])
+        tf = fr.get("true_forces")
+        if tf is None:
+            tf = np.full((len(fr["symbols"]), 3), np.nan, dtype=np.float64)
+            n_missing_forces += 1
+        else:
+            tf = np.asarray(tf, dtype=np.float64)
+            if fr.get("has_forces") is False or not np.isfinite(tf).all():
+                n_missing_forces += 1
+        if fr.get("true_energy") is None:
+            n_missing_energy += 1
         frames.append({
             "positions": fr["positions"].astype(np.float64),
             "atomic_numbers": zs,
             "symbols": fr["symbols"],
             "true_energy": fr["true_energy"],
-            "true_forces": fr["true_forces"].astype(np.float64),
+            "true_forces": tf,
+            "has_forces": bool(fr.get("has_forces", np.isfinite(tf).all())),
             "cell": fr.get("cell"),
             "pbc": fr.get("pbc"),
         })
+    if n_missing_forces:
+        print(
+            f"Warning: {n_missing_forces}/{len(frames)} structures have no "
+            "reference forces (species x y z only). OK for embedding dump; "
+            "force-reliability training/inference needs fx fy fz columns."
+        )
+    if n_missing_energy:
+        print(
+            f"Warning: {n_missing_energy}/{len(frames)} structures have no "
+            "reference energy in the comment line. abs_error will be NaN."
+        )
     return frames
 
 
@@ -842,9 +866,11 @@ def process_batch_dpa3(
         true_energies.append(
             torch.tensor(float(te) if te is not None else float("nan"))
         )
-        true_forces_list.append(
-            torch.tensor(fr["true_forces"], dtype=torch.float32)
-        )
+        tf = fr.get("true_forces")
+        if tf is None:
+            n = int(np.asarray(fr["positions"]).shape[0])
+            tf = np.full((n, 3), np.nan, dtype=np.float32)
+        true_forces_list.append(torch.as_tensor(tf, dtype=torch.float32))
 
     return _pad_cached_structures(
         entries, true_energies, true_forces_list, device, compute_force
@@ -948,9 +974,13 @@ class CachedDPA3Processor:
                 )
                 for fr in batch
             ]
-            true_forces_list = [
-                torch.tensor(fr["true_forces"], dtype=torch.float32) for fr in batch
-            ]
+            true_forces_list = []
+            for fr in batch:
+                tf = fr.get("true_forces")
+                if tf is None:
+                    n = int(np.asarray(fr["positions"]).shape[0])
+                    tf = np.full((n, 3), np.nan, dtype=np.float32)
+                true_forces_list.append(torch.as_tensor(tf, dtype=torch.float32))
             return _pad_cached_structures(
                 entries, true_energies, true_forces_list, device, self.compute_force
             )

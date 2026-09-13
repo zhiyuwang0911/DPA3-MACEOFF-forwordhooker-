@@ -2,12 +2,16 @@
 Extended XYZ I/O for PROBE training data.
 
 Reads structure inputs and reference labels from extxyz:
-  - species, positions  → MACE graph input
-  - energy              → reference energy (labeling)
-  - forces              → reference forces (labeling)
+  - species, positions  → model input (required)
+  - energy              → reference energy (optional; used for labeling)
+  - forces              → reference forces (optional; used for labeling)
+
+Geometry-only XYZ (species x y z) is valid for embedding dump scripts
+such as save_atomic_dpa3.py. Training / force-reliability still needs
+reference energy + forces when those labels are used.
 
 Extra columns (e.g. MACE_forces) and info fields (e.g. MACE_energy) are
-ignored — MACE predictions always come from a live model forward pass,
+ignored — model predictions always come from a live forward pass,
 matching the original PROBE design.
 """
 
@@ -51,33 +55,75 @@ def _get_reference_energy(info: dict) -> Optional[float]:
     return None
 
 
+def _parse_lattice(info: dict) -> Optional[np.ndarray]:
+    raw = info.get("Lattice") or info.get("lattice")
+    if raw is None:
+        return None
+    vals = [float(x) for x in str(raw).replace(",", " ").split()]
+    if len(vals) != 9:
+        return None
+    return np.asarray(vals, dtype=np.float64).reshape(3, 3)
+
+
+def _parse_pbc(info: dict) -> Optional[np.ndarray]:
+    raw = info.get("pbc") or info.get("PBC")
+    if raw is None:
+        return None
+    tokens = str(raw).replace(",", " ").split()
+    if len(tokens) != 3:
+        return None
+    truthy = {"t", "true", "1"}
+    return np.array([t.lower() in truthy for t in tokens], dtype=bool)
+
+
 def read_probe_extxyz_frame(lines: list[str], start: int = 0) -> tuple[dict, int]:
     """
     Parse one extxyz frame starting at `start` (line index of natoms line).
 
-    Atom columns: species  x  y  z  fx  fy  fz  [optional extra columns ignored]
+    Atom columns:
+      required: species  x  y  z
+      optional: fx  fy  fz  [extra columns ignored]
     """
     n_atoms = int(lines[start].strip())
     info = parse_extxyz_info(lines[start + 1])
 
     symbols, positions, true_forces = [], [], []
+    has_forces = None
     for i in range(n_atoms):
         parts = lines[start + 2 + i].split()
-        if len(parts) < 7:
+        if len(parts) < 4:
             raise ValueError(
-                f"Expected >=7 columns per atom (species pos forces), "
+                f"Expected >=4 columns per atom (species x y z), "
                 f"got {len(parts)} at line {start + 3 + i}"
+            )
+        row_has_forces = len(parts) >= 7
+        if has_forces is None:
+            has_forces = row_has_forces
+        elif row_has_forces != has_forces:
+            raise ValueError(
+                f"Inconsistent atom columns in one frame: expected "
+                f"{'forces' if has_forces else 'positions only'}, "
+                f"got {len(parts)} columns at line {start + 3 + i}"
             )
         symbols.append(parts[0])
         positions.append([float(parts[1]), float(parts[2]), float(parts[3])])
-        true_forces.append([float(parts[4]), float(parts[5]), float(parts[6])])
+        if row_has_forces:
+            true_forces.append([float(parts[4]), float(parts[5]), float(parts[6])])
+
+    if has_forces:
+        forces = np.asarray(true_forces, dtype=np.float64)
+    else:
+        forces = np.full((n_atoms, 3), np.nan, dtype=np.float64)
 
     frame = {
         'n_atoms': n_atoms,
         'symbols': symbols,
         'positions': np.asarray(positions, dtype=np.float64),
-        'true_forces': np.asarray(true_forces, dtype=np.float64),
+        'true_forces': forces,
+        'has_forces': bool(has_forces),
         'true_energy': _get_reference_energy(info),
+        'cell': _parse_lattice(info),
+        'pbc': _parse_pbc(info),
         'config_type': info.get('config_type', ''),
         'smiles': info.get('smiles', ''),
         'info': info,

@@ -228,6 +228,11 @@ C x y z fx fy fz
 ...
 ```
 
+Geometry-only XYZ (`species x y z`, no force columns) is accepted by
+`save_atomic_dpa3.py` / embedding cache. Reference `energy=` on the
+comment line is optional there; force-reliability training still needs
+`fx fy fz` and an energy label.
+
 ## Notes
 
 - Units: DeePMD/DPA3 energy **eV**, forces **eV/Å** (PROBE labels use the same).
