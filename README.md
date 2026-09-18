@@ -14,6 +14,7 @@ Same idea as PROBE-multitask + MACE-OFF23, but the backbone is **DPA3**
 |--------|------|
 | `save_atomic_dpa3.py` | Same as MACE `save_atomic_092.py`: dump last-layer feats to one `.npz` (GMM/KDE) |
 | `cache_dpa3_embeddings.py` | **One-pass** DPA3 forward; save `{structure_idx}.pt` embeddings (cache once) |
+| `predict_dpa3.py` | Single-point DPA3 energy/forces on a concatenated `.xyz` |
 | `train_dpa3_multitask.py` | Train PROBE heads (energy + Fa + Fs) on frozen DPA3 feats |
 | `infer_dpa3_multitask.py` | Test / metrics; optional embedding cache |
 
@@ -181,7 +182,28 @@ Resume:
 python train_dpa3_multitask.py --resume --cache-dir ./dpa3_cache_train ...
 ```
 
-## 3) Infer
+## 3) Single-point energy / forces
+
+Run frozen DPA3 on a concatenated multi-frame XYZ (geometry-only is fine):
+
+```bash
+python predict_dpa3.py \
+  --model /path/to/DPA3-L6.pt \
+  --xyz /path/to/concat.xyz \
+  --output-dir ./dpa3_single_point \
+  --device cuda
+```
+
+Writes:
+
+- `predictions.xyz` — same frames, `energy=` / `forces` = DPA3 predictions (eV, eV/Å)
+- `predictions_energy.csv` — per-structure energy
+- `predictions_forces.csv` — per-atom forces
+- `predictions.npz`, `summary.json` — MAE vs reference labels when present
+
+`--energy-only` skips force files. Reference `energy=` / `fx fy fz` in the input are optional and copied as `REF_energy` / `true_*` for error stats.
+
+## 4) Infer
 
 ```bash
 python infer_dpa3_multitask.py \

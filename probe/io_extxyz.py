@@ -155,3 +155,60 @@ def load_probe_extxyz(path: str | Path,
                       max_structures: Optional[int] = None) -> list[dict]:
     """Load all frames from an extended XYZ file."""
     return list(iter_probe_extxyz(path, max_structures=max_structures))
+
+
+def _fmt_xyz_value(value) -> str:
+    if isinstance(value, bool):
+        return "T" if value else "F"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.12g}"
+    text = str(value)
+    if any(c.isspace() for c in text) or not text:
+        return f'"{text}"'
+    return text
+
+
+def format_extxyz_frame(
+    symbols: list[str],
+    positions: np.ndarray,
+    *,
+    energy: Optional[float] = None,
+    forces: Optional[np.ndarray] = None,
+    cell: Optional[np.ndarray] = None,
+    pbc: Optional[np.ndarray] = None,
+    extra_info: Optional[dict] = None,
+) -> str:
+    """Serialize one concatenated-XYZ / extxyz frame."""
+    n_atoms = len(symbols)
+    positions = np.asarray(positions, dtype=np.float64).reshape(n_atoms, 3)
+    info_parts: list[str] = []
+    if cell is not None:
+        lat = " ".join(f"{x:.12g}" for x in np.asarray(cell, dtype=np.float64).reshape(-1))
+        info_parts.append(f'Lattice="{lat}"')
+    props = "species:S:1:pos:R:3"
+    if forces is not None:
+        props += ":forces:R:3"
+    info_parts.append(f"Properties={props}")
+    if energy is not None:
+        info_parts.append(f"energy={float(energy):.12g}")
+    if pbc is not None:
+        flags = " ".join("T" if bool(x) else "F" for x in np.asarray(pbc).reshape(-1))
+        info_parts.append(f'pbc="{flags}"')
+    skip = {"Lattice", "lattice", "Properties", "energy", "pbc", "PBC"}
+    if extra_info:
+        for key, value in extra_info.items():
+            if value is None or key in skip:
+                continue
+            info_parts.append(f"{key}={_fmt_xyz_value(value)}")
+    lines = [str(n_atoms), " ".join(info_parts)]
+    forces_arr = None if forces is None else np.asarray(forces, dtype=np.float64).reshape(n_atoms, 3)
+    for i, sym in enumerate(symbols):
+        x, y, z = positions[i]
+        row = f"{sym} {x:.12g} {y:.12g} {z:.12g}"
+        if forces_arr is not None:
+            fx, fy, fz = forces_arr[i]
+            row += f" {fx:.12g} {fy:.12g} {fz:.12g}"
+        lines.append(row)
+    return "\n".join(lines) + "\n"

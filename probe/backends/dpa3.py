@@ -515,6 +515,32 @@ class DPA3FeatureExtractor(nn.Module):
             out["pred_forces"] = torch.tensor(forces, dtype=torch.float32)
         return out
 
+    def predict_energy_force(
+        self,
+        positions: np.ndarray,
+        atomic_numbers: np.ndarray,
+        cell: Optional[np.ndarray] = None,
+        compute_force: bool = True,
+    ) -> Dict[str, Any]:
+        """Single-point energy (and forces) without capturing embeddings.
+
+        Returns:
+          pred_energy: float (eV)
+          pred_forces: ndarray [nat, 3] (eV/Å), if ``compute_force``
+        """
+        positions = np.asarray(positions, dtype=np.float64)
+        atomic_numbers = np.asarray(atomic_numbers, dtype=np.int32)
+        atype = _z_to_atype(atomic_numbers, self.type_map)
+        if self.infer_wrapper is None:
+            raise RuntimeError("DPA3FeatureExtractor requires a DeePMD infer wrapper.")
+        energy, forces, _ = self._eval_energy_force_and_descriptor(
+            positions, atype, cell, want_descriptor=False
+        )
+        out: Dict[str, Any] = {"pred_energy": float(energy)}
+        if compute_force:
+            out["pred_forces"] = np.asarray(forces, dtype=np.float64).reshape(-1, 3)
+        return out
+
     def _run_eager_for_hook(
         self,
         positions: np.ndarray,
