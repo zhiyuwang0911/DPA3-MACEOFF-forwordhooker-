@@ -123,13 +123,17 @@ def run_inference(model, process_fn, loader, device, bins_e, bins_fa, bins_fm,
                 })
 
             if compute_metrics and not torch.isnan(true_e[i]):
-                store["energy"]["logits"].append(logits_e[i].cpu())
+                # Keep a batch dim so torch.cat works. Indexing [i] on energy /
+                # force-mol yields 0-d labels (and 1-d logits), which cannot be cat'd.
+                store["energy"]["logits"].append(logits_e[i].unsqueeze(0).cpu())
                 store["energy"]["targets"].append(
-                    scalar_to_bin_index(torch.abs(true_e[i] - pred_e[i]), bins_e).cpu()
+                    scalar_to_bin_index(
+                        torch.abs(true_e[i] - pred_e[i]).unsqueeze(0), bins_e
+                    ).cpu()
                 )
-                store["force_mol"]["logits"].append(logits_fm[i].cpu())
+                store["force_mol"]["logits"].append(logits_fm[i].unsqueeze(0).cpu())
                 store["force_mol"]["targets"].append(
-                    scalar_to_bin_index(struct_err[i], bins_fm).cpu()
+                    scalar_to_bin_index(struct_err[i].unsqueeze(0), bins_fm).cpu()
                 )
                 store["force_atom"]["logits"].append(logits_fa[i, :n].cpu())
                 store["force_atom"]["targets"].append(
@@ -137,16 +141,21 @@ def run_inference(model, process_fn, loader, device, bins_e, bins_fa, bins_fm,
                 )
         next_struct += B
 
+    return struct_rows, atom_rows, store
+
+
+def aggregate_metrics(store: dict) -> dict:
     metrics = {}
-    if compute_metrics and store["energy"]["logits"]:
-        for task in ("energy", "force_mol", "force_atom"):
-            logits = torch.cat(store[task]["logits"], dim=0)
-            targets = torch.cat(store[task]["targets"], dim=0)
-            preds = F.softmax(logits, dim=-1).argmax(dim=-1)
-            cm = confusion_matrix_torch(preds, targets, num_classes=2)
-            metrics[task] = compute_all_metrics(cm)
-            metrics[task]["n"] = int(len(targets))
-    return struct_rows, atom_rows, metrics
+    if not store["energy"]["logits"]:
+        return metrics
+    for task in ("energy", "force_mol", "force_atom"):
+        logits = torch.cat(store[task]["logits"], dim=0)
+        targets = torch.cat(store[task]["targets"], dim=0)
+        preds = F.softmax(logits, dim=-1).argmax(dim=-1)
+        cm = confusion_matrix_torch(preds, targets, num_classes=2)
+        metrics[task] = compute_all_metrics(cm)
+        metrics[task]["n"] = int(targets.numel())
+    return metrics
 
 
 def main():
@@ -227,7 +236,7 @@ def main():
         max_structures=args.max_structures,
     )
 
-    struct_rows, atom_rows, metrics = run_inference(
+    struct_rows, atom_rows, store = run_inference(
         model, process_fn, loader, device, bins_e, bins_fa, bins_fm,
         compute_metrics=not args.no_metrics,
     )
@@ -240,7 +249,10 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(atom_rows[0].keys()))
         w.writeheader()
         w.writerows(atom_rows)
+    print(f"Wrote {len(struct_rows)} structures → {out_dir / 'predictions_structure.csv'}")
+    print(f"Wrote {len(atom_rows)} atoms → {out_dir / 'predictions_atom.csv'}")
 
+    metrics = aggregate_metrics(store) if not args.no_metrics else {}
     if metrics:
         # convert tensors in metrics if any
         def _to_jsonable(o):
