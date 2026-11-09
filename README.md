@@ -1,5 +1,9 @@
 # DPA3-MACEOFF-forwardhooker
 
+**New: [DPA3 continuous error regression, full embeddings or PCA](DPA3_REGRESSION.md).**
+Use `train_dpa3_regression.py` and `infer_dpa3_regression.py` for the DPA3
+equivalent of PROBE-regression. The existing scripts below remain classifiers.
+
 PROBE-style **multitask reliability classifier** on frozen
 **[DPA3-SPICE-MACE-OFF](https://www.aissquare.com/models/detail?pageType=models&name=DPA3-SPICE-MACE-OFF&id=388)**
 atomic embeddings (checkpoint **DPA3-L6**).
