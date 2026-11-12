@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from probe.model import MultitaskPROBEModel
+from probe.pca import restore_model
 from probe.backends.dpa3 import (
     load_dpa3,
     load_extxyz_dataloader,
@@ -216,7 +217,7 @@ def main():
     live0 = process_fn(sample, device)
     backbone_dim = int(live0[0].shape[-1])
 
-    model = MultitaskPROBEModel(
+    legacy_config = dict(
         backbone_dim=backbone_dim,
         atom_encoder_hidden=args.atom_encoder_hidden,
         atom_encoder_output_dim=args.atom_encoder_output_dim,
@@ -224,8 +225,13 @@ def main():
         classifier_hidden=args.classifier_hidden,
         atom_force_head_hidden=args.atom_force_head_hidden,
         dropout=args.dropout,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    )
+    if ckpt.get('original_dim', backbone_dim) != backbone_dim:
+        raise ValueError('DPA3 embedding width differs from checkpoint')
+    if ckpt.get('pca_dim') is not None and 'model_config' not in ckpt:
+        raise ValueError('PCA checkpoint missing model_config')
+    model = restore_model(MultitaskPROBEModel,
+        dict(ckpt, model_config=ckpt.get('model_config', legacy_config)), device)
     model.eval()
 
     # rebuild full loader (sample consumed one batch — reload)

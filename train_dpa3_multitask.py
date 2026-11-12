@@ -23,6 +23,7 @@ import torch
 from tqdm.auto import tqdm
 
 from probe.model import MultitaskPROBEModel
+from probe.pca import ModelWithPCA, make_pca, restore_model
 from probe.backends.dpa3 import (
     load_dpa3,
     train_val_split_loader,
@@ -91,6 +92,9 @@ def parse_args():
     p.add_argument("--resume", nargs="?", const="AUTO", default=None)
     p.add_argument("--no-cache-dpa3", action="store_true")
     p.add_argument("--checkpoint-every", type=int, default=None)
+    p.add_argument('--pca-dim', type=int, help='Reduced atomic embedding dimension (8, 32, 64, etc.)')
+    p.add_argument('--pca-model', help='Prefit torch/sklearn PCA artifact; requires --pca-dim')
+    p.add_argument('--pca-max-atoms', type=int, help='Maximum training atoms for fitting PCA')
     return p.parse_args()
 
 
@@ -225,15 +229,36 @@ def main():
         extractor.feat_dim = int(live[0].shape[-1])
 
     # 5. Multitask PROBE
-    model = MultitaskPROBEModel(
-        backbone_dim=extractor.feat_dim,
+    model_config = dict(
+        backbone_dim=args.pca_dim or extractor.feat_dim,
         atom_encoder_hidden=CONFIG["atom_encoder_hidden"],
         atom_encoder_output_dim=CONFIG["atom_encoder_output_dim"],
         mol_attention_heads=CONFIG["mol_attention_heads"],
         classifier_hidden=CONFIG["classifier_hidden"],
         atom_force_head_hidden=CONFIG["atom_force_head_hidden"],
         dropout=CONFIG["dropout"],
-    ).to(device)
+    )
+    if resume_path is not None:
+        saved_dim = ckpt.get('pca_dim')
+        if args.pca_dim is not None and args.pca_dim != saved_dim:
+            raise ValueError('Resume requires unchanged PCA dimension')
+        if args.pca_model or args.pca_max_atoms is not None:
+            raise ValueError('Resume restores saved PCA; omit --pca-model and --pca-max-atoms')
+        if ckpt.get('original_dim', extractor.feat_dim) != extractor.feat_dim:
+            raise ValueError('DPA3 embedding width differs from checkpoint')
+        args.pca_dim = saved_dim
+        model_config = ckpt.get('model_config', model_config)
+        if saved_dim is not None and 'model_config' not in ckpt:
+            raise ValueError('PCA checkpoint missing model_config')
+        model = restore_model(MultitaskPROBEModel, dict(ckpt, model_config=model_config), device)
+        pca_info = ckpt.get('pca_info')
+    else:
+        projection, pca_info = make_pca(process_fn, train_loader, device,
+            args.pca_dim, extractor.feat_dim, args.pca_model, args.pca_max_atoms)
+        model = MultitaskPROBEModel(**model_config)
+        if projection is not None:
+            model = ModelWithPCA(model, projection)
+        model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Multitask PROBE parameters: {n_params:,} | backbone_dim={extractor.feat_dim}")
 
@@ -261,6 +286,9 @@ def main():
         high_conf_cutoffs=CONFIG["high_conf_cutoffs"],
         resume_path=str(resume_path) if resume_path else None,
         checkpoint_every=checkpoint_every,
+        checkpoint_extra=dict(model_config=model_config, pca_dim=args.pca_dim,
+                              original_dim=extractor.feat_dim, pca_info=pca_info,
+                              task='dpa3_multitask_classifier'),
     )
     print(f"Done. Best epoch={history['best_epoch']} → {CONFIG['output_dir']}/")
     extractor.close()

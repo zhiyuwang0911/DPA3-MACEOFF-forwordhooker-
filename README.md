@@ -267,3 +267,62 @@ comment line is optional there; force-reliability training still needs
 MIT — see [LICENSE](LICENSE). PROBE classifier code adapted from
 [PROBE](https://github.com/isayevlab/PROBE) / multitask PROBE-forces.
 DPA3 weights are under their AIS Square / publishers’ license (LGPL-3.0 on card).
+
+## PCA for the DPA3 multitask classifier
+
+Full-dimensional training remains the default. To train the energy and force
+reliability classifier using reduced atomic embeddings:
+
+```bash
+python train_dpa3_multitask.py \
+  --model /path/to/DPA3-L6.pt --train-xyz /path/to/train.xyz \
+  --pca-dim 32 --output-dir ./dpa3_classifier_pca32 \
+  --cache-dir ./dpa3_classifier_train_cache --device cuda
+```
+
+Use 8, 32, 64 or another positive width no greater than the raw embedding width.
+Each dimension needs a new training run. PCA fits only valid training atoms,
+excluding padding/nonfinite embeddings; validation/test data never fit the basis.
+`--pca-max-atoms 1000000` caps fitting to the first training atoms encountered,
+not a random sample. The float64 covariance fit requires more atoms than retained
+components. Raw DPA3 caches remain full-dimensional and reusable across PCA widths.
+Use a cache dedicated to the same backbone, extraction settings and dataset/order;
+the existing numbered cache format does not validate those automatically.
+
+A trusted prefit torch artifact (`mean`, `components`) or sklearn PCA
+`.joblib`/`.pkl` artifact can be supplied with `--pca-model` and `--pca-dim`.
+Sklearn artifact loading requires joblib. Use a DPA3 basis fitted only on allowed
+training data; a MACE projection is not interchangeable.
+
+Best, last and periodic checkpoints include the architecture, original width,
+PCA mean/components and dimension. Inference restores these automatically:
+
+```bash
+python infer_dpa3_multitask.py \
+  --model /path/to/DPA3-L6.pt \
+  --checkpoint /path/to/dpa3_classifier_pca32/best_multitask_model_TIMESTAMP.pt \
+  --test-xyz /path/to/test.xyz --output-dir ./dpa3_classifier_predictions \
+  --device cuda
+```
+
+Use the same DPA3 backbone and extraction settings as training. No PCA argument
+or external PCA file is needed at inference. Legacy checkpoints without saved
+architecture still use the existing inference architecture flags.
+
+Resume using the same data, backbone, extraction settings and loss weights:
+
+```bash
+python train_dpa3_multitask.py \
+  --model /path/to/DPA3-L6.pt --train-xyz /path/to/train.xyz \
+  --output-dir ./dpa3_classifier_pca32 --resume \
+  --cache-dir ./dpa3_classifier_train_cache --device cuda
+```
+
+Resume uses the saved PCA without refitting. `--pca-dim` may be omitted or must
+match the checkpoint. Omit `--pca-model` and `--pca-max-atoms` on resume.
+Legacy full-dimensional checkpoints remain resumable with their matching CONFIG
+architecture. Existing classifier outputs and loss definitions are unchanged.
+
+CPU tests use a simulated DPA3 processor to cover full/PCA training, all checkpoint
+variants, legacy resume, unchanged PCA buffers and inference export. Real DPA3/GPU
+execution requires your pretrained model and dataset.

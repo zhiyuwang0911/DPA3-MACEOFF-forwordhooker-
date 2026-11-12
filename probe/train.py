@@ -565,7 +565,8 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
                            class_weights=None, label_smoothing=0.0,
                            high_conf_cutoffs: Optional[Dict] = None,
                            resume_path: Optional[str] = None,
-                           checkpoint_every: int = 1) -> dict:
+                           checkpoint_every: int = 1,
+                           checkpoint_extra: Optional[dict] = None) -> dict:
     """Full multitask training with best + periodic last checkpoints and resume."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -666,6 +667,7 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
                 'lambda_energy': lambda_energy,
                 'lambda_force_atom': lambda_force_atom,
                 'lambda_force_mol': lambda_force_mol,
+                **(checkpoint_extra or {}),
             }, ckpt_path)
             print(f"  saved best → {ckpt_path}")
         else:
@@ -689,6 +691,7 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
             'lambda_energy': lambda_energy,
             'lambda_force_atom': lambda_force_atom,
             'lambda_force_mol': lambda_force_mol,
+            **(checkpoint_extra or {}),
         }
         save_resumable_checkpoint(
             resumable, output_dir, epoch, checkpoint_every=checkpoint_every)
